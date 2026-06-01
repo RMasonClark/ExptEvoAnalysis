@@ -1,0 +1,184 @@
+---
+title: "ArgEvo mutations breseq v39"
+output: html_notebook
+---
+
+
+Load tidyverse and readxl
+```{r}
+library(tidyverse)
+library(readxl)
+```
+
+Import spreadsheets (I copied and pasted the html output from breseq into separate excel sheets for mutations and new junctions. This does NOT include marginal predictions, since the population setting should catch anything real.)
+```{r}
+mutations_raw <- read_xlsx("ArgEvo_mutations_v39.xlsx")
+junctions_raw <- read_xlsx("ArgEvo_junctions_v39.xlsx")
+```
+
+For intergenic mutations, split rows that show both genes into two separate rows that show the individual genes. I MANUALLY REMOVED slashes in 2 gene names (CsuAB and cation H+ transporters) that messed this separation up since there can only be one of a delimiting character. 
+
+In previous versions, I also removed gene codes A1S_3466 and A1S_3467, but I removed that line here 
+(filter(!(genecode %in% c("A1S_3466", "A1S_3467"))))
+
+```{r}
+mutations_sep <- mutations_raw %>%
+  mutate(genename = str_replace_all(genename, "CsuA/B", "CsuAB")) %>%
+  mutate(genename = str_replace_all(genename, "cation/H+", "cation_H+"))%>%
+  separate_longer_delim(cols = c("genecode", "genename"), delim = "/")
+
+
+junctions_sep <- junctions_raw %>%
+  mutate(genename = str_replace_all(genename, "CsuA/B", "CsuAB")) %>%
+  mutate(genename = str_replace_all(genename, "cation/H+", "cation_H+")) %>%
+  separate_longer_delim(cols = c("genecode", "genename"), delim = "/")
+```
+
+Get rid of arrows and extra spaces in the genecode column
+```{r}
+mutations_clean <- mutations_sep %>%
+  mutate(genecode = str_remove_all(genecode, "[←→]+"),
+         genecode = str_squish(genecode))
+mutations_clean
+```
+
+Remove the known mutations in the LP486 background
+```{r}
+mutations_clean2 <- mutations_clean %>%
+  filter(!(genecode %in% c("A1S_3466", "A1S_3467", "ACX60_06475", "ACX60_06480", "ACX60_13415", "ACX60_17420", "guaA", "[ACX60_18925]–[ACX60_18930]")))
+
+junctions_evolved <- junctions_sep %>%
+  filter(!(genecode %in% c("A1S_3466", "A1S_3467", "ACX60_06475", "ACX60_06480", "ACX60_13415", "ACX60_17420", "guaA", "[ACX60_18925]–[ACX60_18930]")))
+```
+
+Combine both sheets into new dataframe with population, genbank, position, genecode, genename)
+```{r}
+mutations_forjoin <- mutations_clean2 %>%
+  select(-nucleotide)
+
+junctions_forjoin <- junctions_evolved %>%
+  select(-reads_ind, -reads_junc, -score, -skew)
+
+allmutations <- mutations_forjoin %>%
+  bind_rows(junctions_forjoin)
+```
+
+Select only the highest prevalence mutation for each gene within each population
+```{r}
+topmutations <- allmutations %>%
+  arrange(population, genecode, desc(prevalence)) %>%
+  distinct(population, genecode, .keep_all = TRUE)
+```
+
+Set parameters for what gets shown on the graph. Filter for prevalence and then count how many populations it comes up in. Only keep if it shows up in enough populations.
+```{r}
+mutation_order <- topmutations %>%
+  group_by(genecode) %>%
+  filter(n() >= 6) %>%
+  filter(max(prevalence) >= 0.25) %>%
+  summarize(populations = n()) %>%
+  arrange((populations))
+mutation_order
+
+mutation_order_labels <- mutation_order %>%
+  left_join(topmutations %>%
+              select(genecode, genename),
+            by = "genecode" ) %>%
+  distinct(genecode, .keep_all = TRUE) %>%
+  arrange (desc(populations), tolower(genename))
+
+mutation_order_labels
+
+mutations <- topmutations %>%
+  group_by(genecode) %>%
+  filter(n() >= 6) %>%
+  filter(max(prevalence) >= 0.25) %>%
+  ungroup() %>%
+  mutate(genecode = factor(genecode, levels = mutation_order_labels$genecode)) %>%
+  arrange(genecode)
+mutations
+```
+!!MANUAL CURATION NOTES
+
+The mutations in ACX60_18735-18750 are all the same prevalence and correspond to the open reading frames of ISAba1 according to the pAB3 benchling file (see Noel et al 2022, PMID 36316792), so I am consolidating those 4 genes as "ISAba1" and keeping the junction with the maximum prevalence for each population.
+
+The junctions in the intergenic region between ACX60_14695 and ACX60_14700 are ALWAYS new junctions with ISAba1, so I believe it is just a random hotspot- I will consolidate them into a hotspot and keep the junction with the maximum prevalence for each population.
+
+The aspartate kinase gene (ACX60_12650) only has mutations AFTER it, presumably in the promoter for csrA which is just downstream. There were no detected mutations in the coding sequence or promoter for ACX60_12650. I am therefore removing it from the figure.
+
+
+
+```{r}
+ISAba1 <- c("ACX60_18735","ACX60_18740","ACX60_18745","ACX60_18750")
+hotspot <- c("ACX60_14695", "ACX60_14700")
+
+mutations_annot <- mutations %>%
+  mutate(
+    genecode = as.character(genecode),
+    group_id = ifelse(genecode %in% ISAba1, "ISAba1_GROUP", genecode),
+    group_id = ifelse(genecode %in% hotspot, "hotspot", genecode)) %>%
+  group_by(population, coding, group_id) %>%
+  slice_max(prevalence, n = 1, with_ties = FALSE) %>%
+  mutate(
+    genecode = ifelse(genecode %in% ISAba1, "ISAba1", genecode),
+    genecode = ifelse(genecode %in% hotspot, "hotspot", genecode),
+    genename = ifelse(genecode == "ISAba1", "ISAba1", genename),
+    genename = ifelse(genecode == "hotspot", "hotspot", genename)) %>%
+  ungroup() %>%
+  select(-group_id) %>%
+  filter(genecode != "ACX60_12650")
+
+mutations_annot
+  
+```
+
+
+
+Graph it- before manual changes
+```{r}
+label_mapping <- mutations %>%
+  distinct(genecode, genename) %>%
+  deframe()
+
+mutations$genecode <- fct_rev(fct_inorder(mutations$genecode))
+
+mutationsplot <- ggplot(mutations) + 
+  geom_point(aes(x = population, y = genecode, size = prevalence), color = "blue") +
+  scale_y_discrete(
+    name = "Gene",
+    labels = label_mapping) +
+  scale_x_continuous(
+    name = "Population",
+    breaks = 1:12,
+    limits = c(1,12),
+    position = "top") +
+  theme_classic()
+print(mutationsplot)
+
+
+```
+
+Graph it after manual changes
+```{r}
+label_mapping <- mutations_annot %>%
+  distinct(genecode, genename) %>%
+  deframe()
+
+mutations_annot$genecode <- fct_rev(fct_inorder(mutations_annot$genecode))
+
+mutationsannotplot <- ggplot(mutations_annot) + 
+  geom_point(aes(x = population, y = genecode, size = prevalence), color = "blue") +
+  scale_y_discrete(
+    name = "Gene",
+    labels = label_mapping) +
+  scale_x_continuous(
+    name = "Population",
+    breaks = 1:12,
+    limits = c(1,12),
+    position = "top") +
+  theme_classic()
+print(mutationsannotplot)
+
+ggsave("ArgExptEvo.pdf", plot = mutationsannotplot, width = 150, height = 60, units = "mm")
+```
+
